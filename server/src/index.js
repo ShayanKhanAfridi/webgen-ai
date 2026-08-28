@@ -35,6 +35,15 @@ app.use('/api/auth', authRoutes)
 app.use('/api/projects', projectRoutes)
 app.use('/api/ai', aiRoutes)
 
+app.get('/', (req, res) => {
+  res.json({
+    status: 'online',
+    service: 'WebGen AI Backend',
+    version: '1.0.0',
+    message: 'Backend is up and running! 🚀'
+  })
+})
+
 app.get('/api/health', (req, res) => res.json({ status: 'ok' }))
 
 // Create HTTP server (required for WebSocket upgrade)
