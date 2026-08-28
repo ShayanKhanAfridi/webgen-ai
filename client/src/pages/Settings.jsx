@@ -1,8 +1,9 @@
 import { useState, useEffect } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import { Camera, Save, X, Eye, EyeOff, AlertTriangle } from 'lucide-react'
+import { Camera, Save, X, Eye, EyeOff, AlertTriangle, Key, Sparkles, ExternalLink, Check, Loader2 } from 'lucide-react'
 import toast from 'react-hot-toast'
 import { supabase } from '../lib/supabase'
+import api from '../lib/api'
 
 const card = { background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 20, padding: 28, marginBottom: 20 }
 const inp = { width: '100%', background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 12, padding: '11px 16px', fontSize: 14, color: 'var(--text)', outline: 'none', fontFamily: 'Inter,sans-serif', transition: 'border-color .2s,box-shadow .2s', boxSizing: 'border-box' }
@@ -45,7 +46,20 @@ export default function Settings() {
   const [deleteConfirm, setDeleteConfirm] = useState(false)
   const [isGoogleUser, setIsGoogleUser] = useState(false)
 
-  useEffect(() => { loadUser() }, [])
+  // Gemini API Key state (BYOK)
+  const [geminiKey, setGeminiKey] = useState('')
+  const [showGeminiKey, setShowGeminiKey] = useState(false)
+  const [testingKey, setTestingKey] = useState(false)
+  const [savedKeyExists, setSavedKeyExists] = useState(false)
+
+  useEffect(() => {
+    loadUser()
+    const stored = localStorage.getItem('gemini_api_key') || ''
+    if (stored) {
+      setGeminiKey(stored)
+      setSavedKeyExists(true)
+    }
+  }, [])
 
   const loadUser = async () => {
     const { data: { user: authUser } } = await supabase.auth.getUser()
@@ -85,6 +99,46 @@ export default function Settings() {
     } catch { toast.error('Failed to delete account') }
   }
 
+  const handleSaveGeminiKey = async () => {
+    if (!geminiKey.trim()) {
+      toast.error('Please enter a valid API key')
+      return
+    }
+    localStorage.setItem('gemini_api_key', geminiKey.trim())
+    setSavedKeyExists(true)
+    toast.success('Gemini API key saved! All generations will now use your key.')
+  }
+
+  const handleTestGeminiKey = async () => {
+    const keyToTest = geminiKey.trim() || localStorage.getItem('gemini_api_key')
+    if (!keyToTest) {
+      toast.error('Please enter an API key to test')
+      return
+    }
+    setTestingKey(true)
+    try {
+      const { data } = await api.post('/ai/validate-key', {}, {
+        headers: { 'x-gemini-api-key': keyToTest }
+      })
+      if (data.valid) {
+        toast.success(data.message || 'Key is active and working perfectly!')
+      } else {
+        toast.error(data.error || 'Failed to validate key')
+      }
+    } catch (err) {
+      toast.error(err.response?.data?.error || err.message || 'Invalid API key')
+    } finally {
+      setTestingKey(false)
+    }
+  }
+
+  const handleRemoveGeminiKey = () => {
+    localStorage.removeItem('gemini_api_key')
+    setGeminiKey('')
+    setSavedKeyExists(false)
+    toast.success('Custom API key removed. Using default server key.')
+  }
+
   const displayName = profile?.name || user?.email?.split('@')[0] || 'User'
 
   return (
@@ -92,6 +146,89 @@ export default function Settings() {
       <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}>
         <h1 style={{ fontSize: 26, fontWeight: 700, marginBottom: 6 }}>Settings</h1>
         <p style={{ color: 'var(--text-muted)', fontSize: 14, marginBottom: 32 }}>Manage your account and preferences</p>
+
+        {/* AI & API Keys Card */}
+        <div style={card}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <div style={{ width: 36, height: 36, borderRadius: 10, background: 'linear-gradient(135deg,rgba(99,102,241,0.15),rgba(168,85,247,0.15))', border: '1px solid rgba(99,102,241,0.3)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                <Key size={18} color="var(--primary)" />
+              </div>
+              <div>
+                <h2 style={{ fontSize: 16, fontWeight: 700, margin: 0 }}>Google Gemini API Key</h2>
+                <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>Bring Your Own Key (BYOK) for unlimited generation</div>
+              </div>
+            </div>
+            {savedKeyExists ? (
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '4px 10px', borderRadius: 999, background: 'rgba(34,197,94,0.12)', border: '1px solid rgba(34,197,94,0.25)', color: 'var(--success)', fontSize: 11, fontWeight: 600 }}>
+                <Check size={12} /> Custom Key Active
+              </span>
+            ) : (
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, padding: '4px 10px', borderRadius: 999, background: 'rgba(99,102,241,0.1)', border: '1px solid rgba(99,102,241,0.2)', color: 'var(--primary)', fontSize: 11, fontWeight: 600 }}>
+                Default Server Key
+              </span>
+            )}
+          </div>
+
+          <div style={{ background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 12, padding: '12px 16px', marginBottom: 18, fontSize: 13, color: 'var(--text-muted)', lineHeight: 1.5 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, color: 'var(--text)', fontWeight: 600, marginBottom: 4 }}>
+              <Sparkles size={14} color="var(--primary)" /> Why add your own API Key?
+            </div>
+            Using your own free Google AI Studio key gives you independent rate limits (up to 15 RPM / 1,500 requests per day) with zero queue times.
+            <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noreferrer"
+              style={{ display: 'inline-flex', alignItems: 'center', gap: 4, color: 'var(--primary)', fontWeight: 600, marginLeft: 6, textDecoration: 'none' }}>
+              Get Free Gemini Key <ExternalLink size={12} />
+            </a>
+          </div>
+
+          <div style={{ marginBottom: 16 }}>
+            <label style={label}>Gemini API Key</label>
+            <div style={{ position: 'relative' }}>
+              <input
+                type={showGeminiKey ? 'text' : 'password'}
+                value={geminiKey}
+                onChange={e => setGeminiKey(e.target.value)}
+                placeholder="AIzaSy..."
+                style={{ ...inp, paddingRight: 42, fontFamily: 'monospace', fontSize: 13 }}
+                onFocus={e => { e.target.style.borderColor = 'var(--primary)'; e.target.style.boxShadow = '0 0 0 3px var(--primary-glow)' }}
+                onBlur={e => { e.target.style.borderColor = 'var(--border)'; e.target.style.boxShadow = 'none' }}
+              />
+              <button
+                type="button"
+                onClick={() => setShowGeminiKey(s => !s)}
+                style={{ position: 'absolute', right: 12, top: '50%', transform: 'translateY(-50%)', background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)' }}>
+                {showGeminiKey ? <EyeOff size={15} /> : <Eye size={15} />}
+              </button>
+            </div>
+          </div>
+
+          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+            <motion.button
+              whileHover={{ scale: 1.02 }} whileTap={{ scale: .97 }}
+              onClick={handleSaveGeminiKey}
+              style={{ padding: '9px 18px', borderRadius: 10, border: 'none', cursor: 'pointer', background: 'linear-gradient(135deg,var(--primary),var(--accent))', color: '#fff', fontSize: 13, fontWeight: 600, display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+              <Save size={14} /> Save API Key
+            </motion.button>
+
+            <motion.button
+              whileHover={{ scale: 1.02 }} whileTap={{ scale: .97 }}
+              onClick={handleTestGeminiKey}
+              disabled={testingKey}
+              style={{ padding: '9px 16px', borderRadius: 10, border: '1px solid var(--border)', background: 'var(--surface-2, transparent)', color: 'var(--text)', fontSize: 13, fontWeight: 600, cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+              {testingKey ? <Loader2 size={14} className="animate-spin" /> : <Sparkles size={14} />}
+              {testingKey ? 'Testing...' : 'Test Key'}
+            </motion.button>
+
+            {savedKeyExists && (
+              <motion.button
+                whileHover={{ scale: 1.02 }} whileTap={{ scale: .97 }}
+                onClick={handleRemoveGeminiKey}
+                style={{ padding: '9px 16px', borderRadius: 10, border: '1px solid rgba(239,68,68,0.3)', background: 'rgba(239,68,68,0.08)', color: 'var(--error)', fontSize: 13, fontWeight: 500, cursor: 'pointer', marginLeft: 'auto' }}>
+                Remove Key
+              </motion.button>
+            )}
+          </div>
+        </div>
 
         {/* Profile card */}
         <div style={card}>

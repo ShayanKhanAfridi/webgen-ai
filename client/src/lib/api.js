@@ -12,8 +12,12 @@ api.interceptors.request.use(async (config) => {
     if (session?.access_token) {
       config.headers.Authorization = `Bearer ${session.access_token}`
     }
+    const geminiKey = localStorage.getItem('gemini_api_key')
+    if (geminiKey && geminiKey.trim()) {
+      config.headers['x-gemini-api-key'] = geminiKey.trim()
+    }
   } catch (err) {
-    console.error('Error attaching token:', err)
+    console.error('Error attaching token/key:', err)
   }
   return config
 }, (error) => {

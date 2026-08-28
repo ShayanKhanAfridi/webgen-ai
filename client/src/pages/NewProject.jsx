@@ -218,12 +218,15 @@ function NewProjectInner() {
       addLog('Opening compiler channel for real-time asset generation stream...', 'info')
       
       const { data: { session } } = await supabase.auth.getSession()
+      const customApiKey = localStorage.getItem('gemini_api_key') || ''
+      const apiBase = import.meta.env.VITE_API_URL || ''
 
-      const genResponse = await fetch('/api/ai/generate', {
+      const genResponse = await fetch(`${apiBase}/api/ai/generate`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${session?.access_token || ''}`
+          'Authorization': `Bearer ${session?.access_token || ''}`,
+          ...(customApiKey ? { 'x-gemini-api-key': customApiKey } : {})
         },
         body: JSON.stringify({
           prompt,

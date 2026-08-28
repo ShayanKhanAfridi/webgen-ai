@@ -28,6 +28,14 @@ const FALLBACK_MODELS = [
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
+function getGenAI(apiKey) {
+  const key = (apiKey && typeof apiKey === 'string' && apiKey.trim()) ? apiKey.trim() : process.env.GEMINI_API_KEY
+  if (!key) {
+    throw new Error('Gemini API key is missing. Please provide your Gemini API key in Settings or set GEMINI_API_KEY in server environment.')
+  }
+  return new GoogleGenerativeAI(key)
+}
+
 const colorMap = {
   Blue: '#3b82f6', Green: '#22c55e', Purple: '#a855f7',
   Red: '#ef4444', Orange: '#f97316', Monochrome: '#6b7280',
@@ -151,7 +159,8 @@ function cleanJson(text) {
  * Try models in priority order, returning the first successful result.
  * Fix 3: Only real verified model names are in FALLBACK_MODELS.
  */
-async function generateContentWithFallback(prompt, generationConfig = {}) {
+async function generateContentWithFallback(prompt, generationConfig = {}, apiKey = null) {
+  const genAI = getGenAI(apiKey)
   let lastError = null
 
   for (const modelName of FALLBACK_MODELS) {
@@ -180,15 +189,16 @@ async function generateContentWithFallback(prompt, generationConfig = {}) {
  *
  * @param {string} prompt - The initial generation prompt
  * @param {object} config - Extra generationConfig overrides
+ * @param {string|null} apiKey - Optional user-provided Gemini API key
  * @returns {string} - The full concatenated text output
  */
-async function generateWithContinuation(prompt, config = {}) {
+async function generateWithContinuation(prompt, config = {}, apiKey = null) {
   const MAX_CONTINUATIONS = 3
   let fullText = ''
   let currentPrompt = prompt
 
   for (let attempt = 0; attempt <= MAX_CONTINUATIONS; attempt++) {
-    const result = await generateContentWithFallback(currentPrompt, config)
+    const result = await generateContentWithFallback(currentPrompt, config, apiKey)
     const candidate = result.response.candidates?.[0]
     const chunk = result.response.text()
     fullText += chunk
@@ -315,12 +325,36 @@ ${appTsxSummary ? `Here is the frontend App.tsx so your API routes match what th
 
 It should use CORS and JSON parsing. You MUST use ES modules import/export syntax (e.g., "import express from 'express'") instead of CommonJS require(). Return ONLY javascript code, no markdown.`
 
+// ─── /validate-key ────────────────────────────────────────────────────────────
+
+router.post('/validate-key', async (req, res) => {
+  try {
+    const apiKey = req.headers['x-gemini-api-key'] || req.body.apiKey
+    if (!apiKey) return res.status(400).json({ valid: false, error: 'No API key provided' })
+
+    const testGenAI = new GoogleGenerativeAI(apiKey.trim())
+    const model = testGenAI.getGenerativeModel({ model: 'gemini-2.0-flash-lite' })
+    const testResult = await model.generateContent('Say "OK" and nothing else.')
+    const responseText = testResult.response.text()
+
+    if (responseText) {
+      return res.json({ valid: true, message: 'Gemini API key is valid!' })
+    }
+    res.status(400).json({ valid: false, error: 'Unexpected response from Gemini' })
+  } catch (err) {
+    console.error('[validate-key]', err.message)
+    res.status(400).json({ valid: false, error: err.message || 'Invalid API key' })
+  }
+})
+
 // ─── /plan ────────────────────────────────────────────────────────────────────
 
 router.post('/plan', async (req, res) => {
   try {
     const { prompt } = req.body
     if (!prompt) return res.status(400).json({ error: 'Prompt required' })
+
+    const apiKey = req.headers['x-gemini-api-key'] || req.body.apiKey
 
     const result = await generateContentWithFallback(`You are a web/app planner. Given a user's description, return ONLY valid JSON (no markdown):
 {
@@ -330,7 +364,7 @@ router.post('/plan', async (req, res) => {
   "sections": { "PageName": ["section1", "section2"] }
 }
 
-User request: ${prompt}`, { responseMimeType: 'application/json' })
+User request: ${prompt}`, { responseMimeType: 'application/json' }, apiKey)
 
     const plan = JSON.parse(cleanJson(result.response.text()))
     res.json({ plan })
@@ -359,6 +393,7 @@ const generateProject = async (req, res) => {
 
   try {
     const { prompt, theme, colorScheme, stack, projectId, userId } = req.body
+    const apiKey = req.headers['x-gemini-api-key'] || req.body.apiKey
 
     const files = {}
 
@@ -368,7 +403,9 @@ const generateProject = async (req, res) => {
 
       // Fix 1 + Fix 2: Use continuation loop so truncation auto-heals.
       let html = await generateWithContinuation(
-        buildHtmlPrompt(prompt, theme, colorScheme)
+        buildHtmlPrompt(prompt, theme, colorScheme),
+        {},
+        apiKey
       )
       html = html.trim()
 
@@ -511,7 +548,7 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
 
         try {
           // Fix 1 + Fix 2: generateWithContinuation handles MAX_TOKENS automatically
-          let content = await generateWithContinuation(file.getPrompt())
+          let content = await generateWithContinuation(file.getPrompt(), {}, apiKey)
           content = content.trim()
 
           // Remove markdown fences
@@ -574,6 +611,8 @@ router.post('/modify', async (req, res) => {
   try {
     const { message, projectId, files, stack, chatHistory } = req.body
     if (!message) return res.status(400).json({ reply: 'No message provided.', updatedFiles: {}, terminalCommands: [] })
+
+    const apiKey = req.headers['x-gemini-api-key'] || req.body.apiKey
 
     // Load theme and color scheme from Supabase
     let theme = 'Modern Dark'
@@ -649,7 +688,7 @@ Respond in this EXACT JSON format (no markdown, no backticks):
       }
     }
 
-    const result = await generateContentWithFallback(modifyPrompt, { responseMimeType: 'application/json' })
+    const result = await generateContentWithFallback(modifyPrompt, { responseMimeType: 'application/json' }, apiKey)
     const text = result.response.text()
     parsed = await attemptParse(text)
 
@@ -658,7 +697,8 @@ Respond in this EXACT JSON format (no markdown, no backticks):
       try {
         const retryResult = await generateContentWithFallback(
           `Your previous response was not valid JSON. Fix it and return ONLY the JSON object (no markdown, no backticks, no explanation):\n\n${text}`,
-          { responseMimeType: 'application/json' }
+          { responseMimeType: 'application/json' },
+          apiKey
         )
         const retryText = retryResult.response.text()
         parsed = await attemptParse(retryText)
