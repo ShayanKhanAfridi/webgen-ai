@@ -11,8 +11,20 @@ import { setupTerminal } from './terminal.js'
 const app = express()
 const PORT = process.env.PORT || 5000
 
+const allowedOrigins = [
+  'http://localhost:5173',
+  'http://localhost:5174',
+  process.env.CLIENT_URL,
+].filter(Boolean)
+
 app.use(cors({
-  origin: ['http://localhost:5173', 'http://localhost:5174'],
+  origin: (origin, callback) => {
+    // Allow requests with no origin (like server-to-server, curl) or matched origins
+    if (!origin || allowedOrigins.includes(origin) || origin.endsWith('.vercel.app')) {
+      return callback(null, true)
+    }
+    return callback(null, true)
+  },
   credentials: true,
   exposedHeaders: ['Content-Disposition']
 }))
