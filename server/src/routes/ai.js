@@ -9,6 +9,23 @@ router.use(authenticate)
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
 
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+// Fix 1: Raise output token cap — Gemini 2.5 Flash supports up to 65536 output tokens.
+// 8192 (old) ≈ 500–600 lines of dense code — guaranteed truncation for complex apps.
+const GENERATION_CONFIG = {
+  temperature: 0.35,      // Lower = more deterministic code (was 0.7)
+  maxOutputTokens: 65536, // Was 8192 — the #1 truncation culprit
+}
+
+// Fix 3: Only real, verified model names. 'gemini-3.1-flash-lite' doesn't exist.
+const FALLBACK_MODELS = [
+  'gemini-2.5-flash',      // Primary — best quality & context window
+  'gemini-2.0-flash',      // Fallback 1
+  'gemini-2.0-flash-lite', // Fallback 2 — fastest/cheapest
+  'gemini-1.5-flash',      // Fallback 3 — stable older model
+]
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 const colorMap = {
@@ -47,14 +64,21 @@ function getColorValues(colorScheme) {
   return { hex, hsl: `${h} ${s}% ${l}%`, h, s, l }
 }
 
+// Fix 6: Memoize theme prompt strings — same theme+color always produces the same string,
+// no need to recompute hex→HSL math and string-build on every single API call.
+const _themePromptCache = new Map()
+
 function getThemeStylesPrompt(theme, colorScheme) {
-  const isDark = !theme.toLowerCase().includes('light') && 
-                 (theme.toLowerCase().includes('dark') || 
-                  theme.toLowerCase().includes('futuristic') || 
+  const cacheKey = `${theme}:${colorScheme}`
+  if (_themePromptCache.has(cacheKey)) return _themePromptCache.get(cacheKey)
+
+  const isDark = !theme.toLowerCase().includes('light') &&
+                 (theme.toLowerCase().includes('dark') ||
+                  theme.toLowerCase().includes('futuristic') ||
                   theme.toLowerCase().includes('bold') ||
-                  theme.toLowerCase().includes('modern'));
+                  theme.toLowerCase().includes('modern'))
   const colors = getColorValues(colorScheme)
-  
+
   let baseVars = ''
   if (isDark) {
     baseVars = `
@@ -84,7 +108,7 @@ function getThemeStylesPrompt(theme, colorScheme) {
     `
   }
 
-  return `
+  const result = `
 Design Guidelines for "${theme}" Theme and "${colorScheme}" Color Scheme:
 1. You MUST use the following CSS variables inside your stylesheet to set up the design system. Do not hardcode colors; use these HSL variable definitions:
    :root {
@@ -106,6 +130,9 @@ Design Guidelines for "${theme}" Theme and "${colorScheme}" Color Scheme:
    - Use high-contrast hierarchy: clear visual division, crisp font sizes, elegant grid alignments.
    - Do NOT use plain standard HTML colors.
 `
+
+  _themePromptCache.set(cacheKey, result)
+  return result
 }
 
 function cleanJson(text) {
@@ -118,66 +145,74 @@ function cleanJson(text) {
   return cleaned
 }
 
-function getModel(name = 'gemini-2.5-flash') {
-  return genAI.getGenerativeModel({ model: name })
-}
+// ─── Core AI Helpers ──────────────────────────────────────────────────────────
 
+/**
+ * Try models in priority order, returning the first successful result.
+ * Fix 3: Only real verified model names are in FALLBACK_MODELS.
+ */
 async function generateContentWithFallback(prompt, generationConfig = {}) {
-  const modelsToTry = [
-    'gemini-2.5-flash-lite',
-    'gemini-3.1-flash-lite',
-    'gemini-2.5-flash',
-    'gemini-2.0-flash',
-    'gemini-2.0-flash-lite'
-  ]
   let lastError = null
 
-  for (const modelName of modelsToTry) {
+  for (const modelName of FALLBACK_MODELS) {
     try {
       console.log(`[Gemini] Trying model: ${modelName}`)
       const model = genAI.getGenerativeModel({ model: modelName })
       const result = await model.generateContent({
         contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        generationConfig
+        generationConfig: { ...GENERATION_CONFIG, ...generationConfig }
       })
       console.log(`[Gemini] Success with model: ${modelName}`)
       return result
     } catch (err) {
       console.error(`[Gemini] Error with model ${modelName}:`, err.message)
       lastError = err
-      continue
     }
   }
   throw lastError || new Error('All models failed to generate content.')
 }
 
+/**
+ * Fix 1 + Fix 2: Wraps generateContentWithFallback with a continuation loop.
+ * If Gemini hits MAX_TOKENS mid-output, we send a continuation prompt and
+ * append the next chunk — repeating up to MAX_CONTINUATIONS times.
+ * This transparently handles truncation for all callers.
+ *
+ * @param {string} prompt - The initial generation prompt
+ * @param {object} config - Extra generationConfig overrides
+ * @returns {string} - The full concatenated text output
+ */
+async function generateWithContinuation(prompt, config = {}) {
+  const MAX_CONTINUATIONS = 3
+  let fullText = ''
+  let currentPrompt = prompt
 
-// ─── /plan ────────────────────────────────────────────────────────────────────
+  for (let attempt = 0; attempt <= MAX_CONTINUATIONS; attempt++) {
+    const result = await generateContentWithFallback(currentPrompt, config)
+    const candidate = result.response.candidates?.[0]
+    const chunk = result.response.text()
+    fullText += chunk
 
-router.post('/plan', async (req, res) => {
-  try {
-    const { prompt } = req.body
-    if (!prompt) return res.status(400).json({ error: 'Prompt required' })
+    const finishReason = candidate?.finishReason
+    console.log(`[Gemini] finishReason: ${finishReason} (attempt ${attempt})`)
 
-    const result = await generateContentWithFallback(`You are a web/app planner. Given a user's description, return ONLY valid JSON (no markdown):
-{
-  "theme": "Modern | Minimal | Bold | Elegant | Playful",
-  "colorScheme": "Blue | Green | Purple | Red | Orange | Monochrome | Indigo | Cyan | Rose",
-  "pages": ["string"],
-  "sections": { "PageName": ["section1", "section2"] }
+    if (finishReason !== 'MAX_TOKENS') break // STOP or other reason — we're done
+
+    if (attempt === MAX_CONTINUATIONS) {
+      console.warn('[Gemini] MAX_TOKENS hit max continuations, accepting partial output')
+      break
+    }
+
+    // Build a continuation prompt using the tail of the last chunk as context
+    const tail = chunk.slice(-800)
+    currentPrompt = `Continue EXACTLY from where the following code left off. Output ONLY the continuation — no repetition, no explanation, no preamble:\n\n${tail}`
+    console.log(`[Gemini] Requesting continuation (attempt ${attempt + 1}/${MAX_CONTINUATIONS})`)
+  }
+
+  return fullText
 }
 
-User request: ${prompt}`, { responseMimeType: 'application/json' })
-
-    const plan = JSON.parse(cleanJson(result.response.text()))
-    res.json({ plan })
-  } catch (err) {
-    console.error('[plan]', err.message)
-    res.status(500).json({ error: err.message })
-  }
-})
-
-// ─── /generate ────────────────────────────────────────────────────────────────
+// ─── Prompt Builders ──────────────────────────────────────────────────────────
 
 const buildHtmlPrompt = (userPrompt, theme, colorScheme) => `You are an expert web developer and UI/UX designer.
 Create a COMPLETE, STUNNINGLY BEAUTIFUL, FULLY FUNCTIONAL single-page application.
@@ -209,7 +244,7 @@ Project: ${userPrompt}
   "version": "0.0.1",
   "type": "module",
   "scripts": {
-    "dev": "${stack === 'fullstack' ? 'concurrently \\\"vite\\\" \\\"node server/index.js\\\"' : 'vite'}",
+    "dev": "${stack === 'fullstack' ? 'concurrently \\"vite\\" \\"node server/index.js\\"' : 'vite'}",
     "build": "tsc && vite build",
     "preview": "vite preview"
   },
@@ -234,17 +269,6 @@ Include a <div id="root"></div> and a script tag pointing to "/src/main.tsx".
 Project: ${userPrompt}
 Use Google Fonts if appropriate. No explanation, just index.html content.`
 
-const buildViteConfigPrompt = () => `Return ONLY the vite.config.ts file content for a React TypeScript project.
-It should import defineConfig from 'vite' and react from '@vitejs/plugin-react'.
-Return ONLY code, no explanation.`
-
-const buildTsConfigPrompt = () => `Return ONLY the tsconfig.json file content for a standard React TypeScript Vite project.
-Return ONLY valid JSON, no explanation.`
-
-const buildMainTsxPrompt = () => `Return ONLY the src/main.tsx file content.
-It should import React, ReactDOM, App from './App.tsx', './App.css', and render App in React.StrictMode at 'root'.
-Return ONLY TypeScript code, no explanation.`
-
 const buildAppTsxPrompt = (userPrompt, theme, colorScheme) => `You are a senior React developer and UI/UX expert.
 Write a COMPLETE, PRODUCTION-QUALITY, STUNNINGLY BEAUTIFUL React TypeScript app.
 
@@ -266,17 +290,57 @@ Requirements:
 
 Return ONLY the TypeScript code. Start with imports.`
 
-const buildCssPrompt = (userPrompt, theme, colorScheme) => `Generate complete, modern CSS for a React TypeScript project.
+// Fix 4: App.css prompt now accepts appTsxSummary — so CSS knows exactly which
+// classNames to style, preventing mismatch between App.tsx and App.css.
+const buildCssPrompt = (userPrompt, theme, colorScheme, appTsxSummary = '') => `Generate complete, modern CSS for a React TypeScript project.
 User wants: "${userPrompt}"
 Theme: ${theme}
 Primary color scheme: ${colorScheme}
 
 ${getThemeStylesPrompt(theme, colorScheme)}
 
+${appTsxSummary ? `Here is the App.tsx source so you can style every className it uses:\n\`\`\`tsx\n${appTsxSummary}\n\`\`\`` : ''}
+
 Requirements:
-- Make sure to style all custom classNames used in App.tsx.
+- Style ALL custom classNames used in App.tsx (see source above).
 - Include transitions, active states, focus rings, hover effects.
 - Return ONLY CSS, no explanation.`
+
+// Fix 4: server/index.js prompt includes App.tsx context so API routes match frontend calls.
+const buildServerPrompt = (userPrompt, theme, colorScheme, appTsxSummary = '') => `Return ONLY code for a simple Express server index.js file.
+For a full-stack project description: "${userPrompt}"
+Theme: ${theme}. Color scheme: ${colorScheme}.
+
+${appTsxSummary ? `Here is the frontend App.tsx so your API routes match what the frontend calls:\n\`\`\`tsx\n${appTsxSummary}\n\`\`\`` : ''}
+
+It should use CORS and JSON parsing. You MUST use ES modules import/export syntax (e.g., "import express from 'express'") instead of CommonJS require(). Return ONLY javascript code, no markdown.`
+
+// ─── /plan ────────────────────────────────────────────────────────────────────
+
+router.post('/plan', async (req, res) => {
+  try {
+    const { prompt } = req.body
+    if (!prompt) return res.status(400).json({ error: 'Prompt required' })
+
+    const result = await generateContentWithFallback(`You are a web/app planner. Given a user's description, return ONLY valid JSON (no markdown):
+{
+  "theme": "Modern | Minimal | Bold | Elegant | Playful",
+  "colorScheme": "Blue | Green | Purple | Red | Orange | Monochrome | Indigo | Cyan | Rose",
+  "pages": ["string"],
+  "sections": { "PageName": ["section1", "section2"] }
+}
+
+User request: ${prompt}`, { responseMimeType: 'application/json' })
+
+    const plan = JSON.parse(cleanJson(result.response.text()))
+    res.json({ plan })
+  } catch (err) {
+    console.error('[plan]', err.message)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// ─── /generate ────────────────────────────────────────────────────────────────
 
 const generateProject = async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream')
@@ -298,53 +362,38 @@ const generateProject = async (req, res) => {
 
     const files = {}
 
+    // ── HTML stack ────────────────────────────────────────────────────────────
     if (stack === 'html') {
       send({ type: 'progress', step: 'Generating complete app...' })
-      
-      const model = genAI.getGenerativeModel({ 
-        model: 'gemini-2.5-flash',
-        generationConfig: {
-          temperature: 0.7,
-          maxOutputTokens: 8192,
-        }
-      })
-      
-      const result = await generateContentWithFallback(
-        buildHtmlPrompt(prompt, theme, colorScheme),
-        { temperature: 0.7, maxOutputTokens: 8192 }
+
+      // Fix 1 + Fix 2: Use continuation loop so truncation auto-heals.
+      let html = await generateWithContinuation(
+        buildHtmlPrompt(prompt, theme, colorScheme)
       )
-      let html = result.response.text().trim()
-      
-      // Clean up if wrapped in markdown
+      html = html.trim()
+
+      // Clean up if wrapped in markdown fences
       if (html.startsWith('```')) {
         html = html
           .replace(/^```html?\n?/, '')
           .replace(/\n?```$/, '')
           .trim()
       }
-      
-      files['index.html'] = html
-      send({ 
-        type: 'file', 
-        filename: 'index.html', 
-        content: html 
-      })
 
+      files['index.html'] = html
+      send({ type: 'file', filename: 'index.html', content: html })
+
+    // ── React / Fullstack stack ───────────────────────────────────────────────
     } else if (stack === 'react' || stack === 'fullstack') {
-      
-      const filesToGenerate = [
-        { 
-          name: 'package.json', 
-          step: 'Setting up package.json...',
-          prompt: buildPackageJsonPrompt(prompt, stack)
-        },
-        { 
-          name: 'index.html', 
-          step: 'Creating HTML entry...',
-          prompt: buildIndexHtmlPrompt(prompt)
-        },
-        { 
-          name: 'vite.config.ts', 
+
+      // Fix 4: We'll collect the generated App.tsx content to pass as context
+      // into App.css and server/index.js generation prompts.
+      let appTsxContent = ''
+
+      // Static files — no AI call needed, emit immediately
+      const staticFiles = [
+        {
+          name: 'vite.config.ts',
           step: 'Configuring Vite...',
           content: `import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
@@ -356,8 +405,8 @@ export default defineConfig({
   }
 })`
         },
-        { 
-          name: 'tsconfig.json', 
+        {
+          name: 'tsconfig.json',
           step: 'TypeScript config...',
           content: `{
   "compilerOptions": {
@@ -381,13 +430,13 @@ export default defineConfig({
   "include": ["src"]
 }`
         },
-        { 
-          name: 'src/vite-env.d.ts', 
+        {
+          name: 'src/vite-env.d.ts',
           step: 'Vite environment...',
           content: `/// <reference types="vite/client" />`
         },
-        { 
-          name: 'src/main.tsx', 
+        {
+          name: 'src/main.tsx',
           step: 'Creating entry point...',
           content: `import React from 'react'
 import ReactDOM from 'react-dom/client'
@@ -400,90 +449,91 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
   </React.StrictMode>,
 )`
         },
-        { 
-          name: 'src/App.tsx', 
-          step: 'Generating main app...',
-          prompt: buildAppTsxPrompt(prompt, theme, colorScheme)
+      ]
+
+      // Emit all static files immediately
+      for (const file of staticFiles) {
+        send({ type: 'progress', step: file.step })
+        files[file.name] = file.content
+        send({ type: 'file', filename: file.name, content: file.content })
+      }
+
+      // AI-generated files — ordered so App.tsx is before App.css and server/index.js
+      const aiFiles = [
+        {
+          name: 'package.json',
+          step: 'Setting up package.json...',
+          getPrompt: () => buildPackageJsonPrompt(prompt, stack),
         },
-        { 
-          name: 'src/App.css', 
+        {
+          name: 'index.html',
+          step: 'Creating HTML entry...',
+          getPrompt: () => buildIndexHtmlPrompt(prompt),
+        },
+        {
+          name: 'src/App.tsx',
+          step: 'Generating main app...',
+          getPrompt: () => buildAppTsxPrompt(prompt, theme, colorScheme),
+          // After generation, capture content for context chaining
+          onGenerated: (content) => { appTsxContent = content },
+        },
+        {
+          name: 'src/App.css',
           step: 'Creating styles...',
-          prompt: buildCssPrompt(prompt, theme, colorScheme)
+          // Fix 4: Pass App.tsx context (first 3000 chars) so CSS targets correct classNames
+          getPrompt: () => buildCssPrompt(prompt, theme, colorScheme, appTsxContent.slice(0, 3000)),
         },
       ]
 
       if (stack === 'fullstack') {
-        filesToGenerate.push(
+        aiFiles.push(
           {
             name: 'server/index.js',
             step: 'Generating backend server...',
-            prompt: `Return ONLY code for a simple Express server index.js file.
-For a full-stack project description: "${prompt}"
-Theme: ${theme}. Color scheme: ${colorScheme}.
-It should use CORS and JSON parsing. You MUST use ES modules import/export syntax (e.g., "import express from 'express'") instead of CommonJS require(). Return ONLY javascript code, no markdown.`
+            // Fix 4: Pass App.tsx context so Express routes match frontend API calls
+            getPrompt: () => buildServerPrompt(prompt, theme, colorScheme, appTsxContent.slice(0, 3000)),
           },
           {
             name: 'server/package.json',
             step: 'Setting up backend package.json...',
-            prompt: `Return ONLY package.json for an Express server. Use type: module. Include express, cors dependencies. Return ONLY JSON, no markdown.`
+            getPrompt: () => `Return ONLY package.json for an Express server. Use type: module. Include express, cors dependencies. Return ONLY JSON, no markdown.`,
           },
           {
             name: 'README.md',
             step: 'Creating README...',
-            prompt: `Return ONLY markdown content for README.md explaining how to run the project. Return ONLY markdown, no explanations.`
+            getPrompt: () => `Return ONLY markdown content for README.md explaining how to run the project. Return ONLY markdown, no explanations.`,
           }
         )
       }
 
-      const model = genAI.getGenerativeModel({ 
-        model: 'gemini-2.5-flash',
-        generationConfig: {
-          temperature: 0.7,
-          maxOutputTokens: 8192,
-        }
-      })
-
-      for (const file of filesToGenerate) {
+      for (const file of aiFiles) {
         send({ type: 'progress', step: file.step })
-        
+
         try {
-          let content
-          if (file.content) {
-            content = file.content
-          } else {
-            const result = await generateContentWithFallback(file.prompt, {
-              temperature: 0.7,
-              maxOutputTokens: 8192
-            })
-            content = result.response.text().trim()
-            
-            // Remove markdown fences
-            if (content.startsWith('```')) {
-              content = content
-                .replace(/^```[\w]*\n?/, '')
-                .replace(/\n?```$/, '')
-                .trim()
-            }
+          // Fix 1 + Fix 2: generateWithContinuation handles MAX_TOKENS automatically
+          let content = await generateWithContinuation(file.getPrompt())
+          content = content.trim()
+
+          // Remove markdown fences
+          if (content.startsWith('```')) {
+            content = content
+              .replace(/^```[\w]*\n?/, '')
+              .replace(/\n?```$/, '')
+              .trim()
           }
-          
+
+          // Fix 4: Run the onGenerated hook (e.g. to capture App.tsx for context chaining)
+          if (file.onGenerated) file.onGenerated(content)
+
           files[file.name] = content
-          send({ 
-            type: 'file', 
-            filename: file.name, 
-            content 
-          })
-          
+          send({ type: 'file', filename: file.name, content })
+
           // Small delay to avoid rate limiting
-          if (!file.content) {
-            await new Promise(r => setTimeout(r, 500))
-          }
-          
+          await new Promise(r => setTimeout(r, 500))
+
         } catch (fileErr) {
           console.error(`Error generating ${file.name}:`, fileErr)
-          send({ 
-            type: 'warning', 
-            message: `Skipped ${file.name}: ${fileErr.message}` 
-          })
+          send({ type: 'warning', message: `Skipped ${file.name}: ${fileErr.message}` })
         }
       }
     }
@@ -492,7 +542,7 @@ It should use CORS and JSON parsing. You MUST use ES modules import/export synta
     if (projectId && userId) {
       await supabase
         .from('projects')
-        .update({ 
+        .update({
           generated_files: files,
           updated_at: new Date().toISOString()
         })
@@ -557,7 +607,7 @@ router.post('/modify', async (req, res) => {
       .map(m => `${m.role === 'user' ? 'User' : 'AI'}: ${m.content}`)
       .join('\n')
 
-    const prompt = `You are an expert ${stackLabel} developer helping modify a project.
+    const modifyPrompt = `You are an expert ${stackLabel} developer helping modify a project.
 
 Current Theme: ${theme}
 Current Color Scheme: ${colorScheme}
@@ -587,15 +637,41 @@ Respond in this EXACT JSON format (no markdown, no backticks):
   "terminalCommands": []
 }`
 
-    const result = await generateContentWithFallback(prompt, { responseMimeType: 'application/json' })
-    const text = result.response.text()
-
     let parsed
-    try {
-      parsed = JSON.parse(cleanJson(text))
-    } catch (parseErr) {
-      console.error('[modify API] JSON parse failed:', parseErr.message, '\nRaw text was:', text)
-      parsed = { reply: text, updatedFiles: {}, terminalCommands: [] }
+
+    // Fix 5: On JSON parse failure, retry once before giving up.
+    // Silent fail (returning updatedFiles: {}) made it look like changes were made when nothing happened.
+    const attemptParse = async (responseText) => {
+      try {
+        return JSON.parse(cleanJson(responseText))
+      } catch {
+        return null
+      }
+    }
+
+    const result = await generateContentWithFallback(modifyPrompt, { responseMimeType: 'application/json' })
+    const text = result.response.text()
+    parsed = await attemptParse(text)
+
+    if (!parsed) {
+      console.warn('[modify API] First JSON parse failed, retrying with correction prompt...')
+      try {
+        const retryResult = await generateContentWithFallback(
+          `Your previous response was not valid JSON. Fix it and return ONLY the JSON object (no markdown, no backticks, no explanation):\n\n${text}`,
+          { responseMimeType: 'application/json' }
+        )
+        const retryText = retryResult.response.text()
+        parsed = await attemptParse(retryText)
+
+        if (!parsed) {
+          console.error('[modify API] Retry also failed to produce valid JSON. Raw retry text:', retryText)
+          throw new Error('Could not parse a valid JSON response from the AI after retry.')
+        }
+        console.log('[modify API] Retry succeeded — JSON parsed successfully.')
+      } catch (retryErr) {
+        console.error('[modify API] Retry error:', retryErr.message)
+        throw retryErr
+      }
     }
 
     // Ensure required fields
@@ -636,7 +712,7 @@ Respond in this EXACT JSON format (no markdown, no backticks):
   } catch (err) {
     console.error('[modify]', err.message)
     res.status(500).json({
-      reply: 'Sorry, I encountered an error. Please try again.',
+      reply: 'Sorry, I encountered an error processing your request. Please try again.',
       updatedFiles: {},
       terminalCommands: []
     })
